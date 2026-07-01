@@ -1624,11 +1624,13 @@ services:
 | Error | Cause | Solution |
 |-------|-------|----------|
 | `ModuleNotFoundError: No module named 'uvicorn'` | Dependencies not installed | `pip install -r app/requirements.txt` |
-| `Model not loaded` | model.pkl not found | Check `MODEL_PATH`, run `python -m app.train_model` |
-| `ValueError: URL must include a 'scheme', 'host', and 'port'` | ES URL missing port | Use `http://192.168.1.123:80` (with `:80`) |
+|| `Model not loaded` | model.pkl not found | Check `MODEL_PATH`, run `python -m app.train_model` |
+|| `No module named 'monitor'` | PYTHONPATH မသတ်မှတ်ထား | Set `PYTHONPATH=$PWD/app` or `cd app` then run uvicorn |
+|| `ValueError: URL must include a 'scheme', 'host', and 'port'` | ES URL missing port | Use `http://192.168.1.123:80` (with `:80`) |
 | `Accept version must be either version 8 or 7, but found 9` | elasticsearch-py 9.x | Install `elasticsearch==8.12.0` |
 | `Address already in use` | Port occupied | `taskkill //F //PID <PID>` or change port |
-| `[WARN] ES inference log failed` | ES unreachable | Check ES host, credentials, network |
+|| `[WARN] ES inference log failed` | ES unreachable | Check ES host, credentials, network |
+|| `no write index is defined for alias [ml-inference]` | Alias has `is_write_index=false` | Set `is_write_index=true` on backing index (see §9.3) |
 
 ### 9.2 Debug Commands
 
@@ -1652,6 +1654,92 @@ m = joblib.load('model/model.pkl')
 print(m.predict(np.array([[250, 5000, 4750, 2000, 2250]])))
 print(m.predict_proba(np.array([[250, 5000, 4750, 2000, 2250]])))
 "
+```
+
+---
+
+### 9.3 ES Alias `is_write_index` Fix — Elasticsearch Alias ၏ Write Index သတ်မှတ်ခြင်း
+
+ဤအပိုင်းသည် `[WARN] ES inference log failed: BadRequestError(400, 'illegal_argument_exception', 'no write index is defined for alias [ml-inference]')` အမှားကို ဖြေရှင်းနည်းဖြစ်သည်။
+
+#### 9.3.1 ပြဿနာ၏သဘောသဘာဝ (Problem Description)
+
+`monitor.py` သည် `es.index(index="ml-inference", ...)` ဖြင့် inference log များကို Elasticsearch သို့ ပို့သည်။ သို့သော် `ml-inference` သည် **alias** တစ်ခုသာဖြစ်ပြီး၊ concrete index မဟုတ်ပါ။ ES တွင် alias သည် index တစ်ခု (သို့မဟုတ် အများအပြား) ကို ညွှန်ပြသော နာမည်တစ်ခုသာဖြစ်သည် — ၎င်းသည် သူ့ဘာသာ data သိမ်းဆည်း၍မရပါ။
+
+အကယ်၍ alias ၏လက်အောက်ရှိ index များအနက် တစ်ခုကိုမျှ `is_write_index=true` ဟု သတ်မှတ်မထားပါက၊ ES သည် ထို alias သို့ document အသစ်များ ရေးသွင်းခြင်းကို **ငြင်းပယ်** သည်။
+
+```
+Alias: ml-inference
+  └── Index: ml-inference-000001  (is_write_index = false  ← မရေးနိုင်)
+```
+
+#### 9.3.2 စစ်ဆေးနည်း (Diagnosis)
+
+```bash
+# 1. Alias များကို စစ်ဆေးရန်
+curl -u elastic:'ML0psElk!2026' \
+     http://192.168.1.123:80/_cat/aliases/ml-inference?v
+
+# Output:
+# alias        index               is_write_index
+# ml-inference ml-inference-000001 false          ← ဒါကိုပြင်ရမည်
+
+# 2. Concrete index ရှိမရှိစစ်ရန်
+curl -u elastic:'ML0psElk!2026' \
+     http://192.168.1.123:80/_cat/indices/ml-*?v
+```
+
+#### 9.3.3 ဖြေရှင်းနည်း (Fix)
+
+```bash
+curl -u elastic:'ML0psElk!2026' -X POST \
+     http://192.168.1.123:80/_aliases \
+     -H "Content-Type: application/json" \
+     -d '{
+       "actions": [
+         {
+           "add": {
+             "index": "ml-inference-000001",
+             "alias": "ml-inference",
+             "is_write_index": true
+           }
+         }
+       ]
+     }'
+```
+
+**ရှင်းလင်းချက်:** `_aliases` API ကို အသုံးပြု၍ `ml-inference` alias ၏လက်အောက်ရှိ `ml-inference-000001` index အား `is_write_index: true` ဖြင့် ထပ်မံထည့်သွင်းလိုက်ခြင်းဖြစ်သည်။ တစ်ကြိမ်သာ လုပ်ဆောင်ရန် လိုအပ်ပြီး နောက်ပိုင်းတွင် အလိုအလျောက် အလုပ်လုပ်သွားမည်။
+
+#### 9.3.4 အတည်ပြုစစ်ဆေးခြင်း (Verification)
+
+```bash
+# 1. Alias ကိုပြန်စစ်ရန်
+curl -u elastic:'ML0psElk!2026' \
+     http://192.168.1.123:80/_cat/aliases/ml-inference?v
+# Output:  is_write_index = true  ✓
+
+# 2. Test document ရေးသွင်းကြည့်ရန်
+curl -u elastic:'ML0psElk!2026' -X POST \
+     http://192.168.1.123:80/ml-inference/_doc \
+     -H "Content-Type: application/json" \
+     -d '{"@timestamp": "2026-07-01T00:00:00Z", "test": true}'
+# Output: {"result":"created", ...}
+
+# 3. Predict endpoint ခေါ်၍ WARN မရှိတော့ကြောင်းစစ်ရန်
+curl -X POST http://localhost:8080/predict \
+  -H "Content-Type: application/json" \
+  -d '{"features": [1,2,3,4,5]}'
+# WARN line မပေါ်တော့ပါ
+```
+
+#### 9.3.5 ကြိုတင်ကာကွယ်ရန် (Prevention)
+
+Index Lifecycle Management (ILM) policy အသုံးပြုပါက alias အား write index အလိုအလျောက် သတ်မှတ်ပေးနိုင်သည်။ `monitor.py` အတွင်း concrete index name (`ml-inference-000001`) ကို တိုက်ရိုက်သုံးမည့်အစား alias ကိုသာ သုံးသင့်သည် (ထိုသို့သုံးမှ ILM က rollover လုပ်သည့်အခါ အလိုအလျောက် ချိန်ညှိပေးနိုင်မည်)။
+
+```python
+# monitor.py — ဖြစ်နိုင်လျှင် ILM + alias ပုံစံကိုပဲ ဆက်သုံးပါ
+self.inference_index = "ml-inference"       # alias (recommended)
+# self.inference_index = "ml-inference-000001"  # concrete (not recommended)
 ```
 
 ---
